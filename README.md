@@ -38,7 +38,7 @@ Everything is configured to **survive reboots automatically**.
 Open **Terminal** (press `⌘ Space`, type `Terminal`, press Enter) and paste this:
 
 ```bash
-curl -fsSL https://github.com/microlaser/main/setup_dns_privacy.sh -o setup_dns_privacy.sh
+curl -fsSL https://raw.githubusercontent.com/microlaser/secure_mac_dns/main/setup_dns_privacy.sh -o setup_dns_privacy.sh
 sudo bash setup_dns_privacy.sh
 ```
 
