@@ -66,6 +66,11 @@ else
     BREW_BIN="/usr/local/bin/brew"
 fi
 
+STUBBY_BIN="$BREW_PREFIX/opt/stubby/bin/stubby"
+DNSMASQ_BIN="$BREW_PREFIX/sbin/dnsmasq"
+STUBBY_PLIST="/Library/LaunchDaemons/homebrew.mxcl.stubby.plist"
+DNSMASQ_PLIST="/Library/LaunchDaemons/homebrew.mxcl.dnsmasq.plist"
+
 # ── Preflight checks ──────────────────────────────────────────────────────────
 print_banner
 
@@ -84,7 +89,7 @@ fi
 # Must be macOS
 [[ "$(uname)" == "Darwin" ]] || fatal "This script only works on macOS."
 
-# Save the real (non-root) username for brew commands
+# Save the real (non-root) username for brew install commands
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo '')}"
 [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]] && \
     fatal "Could not determine your username. Make sure to use 'sudo bash', not 'sudo su'."
@@ -122,20 +127,20 @@ export PATH="$BREW_PREFIX/bin:$BREW_PREFIX/sbin:$PATH"
 # =============================================================================
 step "Phase 2 of 7 — Installing stubby and dnsmasq"
 
-# Stop any running instances before touching packages
-sudo -u "$REAL_USER" brew services stop stubby  2>/dev/null || true
-sudo -u "$REAL_USER" brew services stop dnsmasq 2>/dev/null || true
+# Stop and unload any running instances before touching packages
+launchctl unload "$STUBBY_PLIST"  2>/dev/null || true
+launchctl unload "$DNSMASQ_PLIST" 2>/dev/null || true
 pkill -x stubby  2>/dev/null || true
 pkill -x dnsmasq 2>/dev/null || true
 sleep 1
 
 progress "Installing stubby (DNS-over-TLS daemon)..."
-sudo -u "$REAL_USER" brew install stubby 2>&1 | grep -E "install|already|Error" | \
+sudo -u "$REAL_USER" "$BREW_BIN" install stubby 2>&1 | grep -E "install|already|Error" | \
     while IFS= read -r line; do info "$line"; done || true
 ok "stubby ready"
 
 progress "Installing dnsmasq (local DNS bridge)..."
-sudo -u "$REAL_USER" brew install dnsmasq 2>&1 | grep -E "install|already|Error" | \
+sudo -u "$REAL_USER" "$BREW_BIN" install dnsmasq 2>&1 | grep -E "install|already|Error" | \
     while IFS= read -r line; do info "$line"; done || true
 ok "dnsmasq ready"
 
@@ -148,7 +153,6 @@ info "Quad9 (quad9.net) is a non-profit, privacy-respecting, malware-blocking re
 
 mkdir -p "$(dirname "$STUBBY_CONF")"
 
-# Write a clean, complete config — never patch, always replace
 cat > "$STUBBY_CONF" <<'YAML'
 # stubby configuration — managed by setup_dns_privacy.sh
 # Encrypts DNS queries using DNS-over-TLS (port 853) to Quad9
@@ -193,7 +197,7 @@ YAML
 
 ok "stubby configured (listens on 127.0.0.1:5300, upstream → Quad9 via TLS)"
 
-# Validate the config file is parseable
+# Validate the config file
 STUBBY_TEST=$(stubby -l 2>&1 &
     SPID=$!; sleep 2; kill $SPID 2>/dev/null; wait $SPID 2>/dev/null || true)
 if echo "$STUBBY_TEST" | grep -qi "Generic error\|parse error\|invalid\|failed"; then
@@ -230,18 +234,18 @@ server=127.0.0.1#5300
 # Cache up to 1000 responses for speed
 cache-size=1000
 
-# Log to syslog for diagnostics (silent unless you check Console.app)
+# Log for diagnostics
 log-facility=/var/log/dnsmasq.log
 CONF
 
 ok "dnsmasq configured (port 53 → stubby:5300)"
 
 # =============================================================================
-#  PHASE 5 — Start services and verify they're running
+#  PHASE 5 — Start services via LaunchDaemons (no brew services needed)
 # =============================================================================
 step "Phase 5 of 7 — Starting services"
 
-# Clear anything squatting on port 5300
+# Clear anything squatting on ports 53 and 5300
 for port in 53 5300; do
     PIDS=$(lsof -nP -iUDP:$port -iTCP:$port 2>/dev/null \
         | awk 'NR>1 && $1!="mDNSRespo" {print $2}' | sort -u || true)
@@ -255,26 +259,49 @@ for port in 53 5300; do
     fi
 done
 
-# Start stubby
-info "Starting stubby..."
-sudo -u "$REAL_USER" brew services start stubby
+# ── stubby LaunchDaemon ───────────────────────────────────────────────────────
+# We use a LaunchDaemon instead of 'brew services' because brew services
+# refuses to run correctly under a root shell (sudo su), which causes
+# permission errors in Homebrew's Ruby/bootsnap cache at /var/root.
+# A LaunchDaemon runs as root natively and survives reboots identically.
+info "Installing stubby LaunchDaemon..."
+cat > "$STUBBY_PLIST" <<SPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>             <string>homebrew.mxcl.stubby</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${STUBBY_BIN}</string>
+    <string>-C</string>
+    <string>${STUBBY_CONF}</string>
+  </array>
+  <key>RunAtLoad</key>         <true/>
+  <key>KeepAlive</key>         <true/>
+  <key>StandardErrorPath</key> <string>/var/log/stubby_err.log</string>
+</dict>
+</plist>
+SPLIST
+
+launchctl unload "$STUBBY_PLIST" 2>/dev/null || true
+sleep 1
+launchctl load -w "$STUBBY_PLIST"
 sleep 3
 
 if ! pgrep -x stubby &>/dev/null; then
-    err "stubby failed to start. Trying once more..."
-    sudo -u "$REAL_USER" brew services restart stubby
+    err "stubby failed to start via LaunchDaemon. Trying direct launch..."
+    "$STUBBY_BIN" -C "$STUBBY_CONF" &
     sleep 3
 fi
-pgrep -x stubby &>/dev/null || fatal "stubby won't start. Run 'sudo stubby -l' for details."
+pgrep -x stubby &>/dev/null \
+    || fatal "stubby won't start. Check: cat /var/log/stubby_err.log"
 ok "stubby running (PID $(pgrep -x stubby | head -1))"
 
-# Start dnsmasq (must run as root to bind port 53)
-info "Starting dnsmasq..."
-# dnsmasq needs to run as root for port 53 — use a LaunchDaemon
-DNSMASQ_BIN="$BREW_PREFIX/sbin/dnsmasq"
-DNSMASQ_PLIST="/Library/LaunchDaemons/homebrew.mxcl.dnsmasq.plist"
-
-cat > "$DNSMASQ_PLIST" <<PLIST
+# ── dnsmasq LaunchDaemon ──────────────────────────────────────────────────────
+info "Installing dnsmasq LaunchDaemon..."
+cat > "$DNSMASQ_PLIST" <<DPLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -292,7 +319,7 @@ cat > "$DNSMASQ_PLIST" <<PLIST
   <key>StandardErrorPath</key> <string>/var/log/dnsmasq_err.log</string>
 </dict>
 </plist>
-PLIST
+DPLIST
 
 launchctl unload "$DNSMASQ_PLIST" 2>/dev/null || true
 sleep 1
@@ -304,7 +331,8 @@ if ! pgrep -x dnsmasq &>/dev/null; then
     "$DNSMASQ_BIN" --keep-in-foreground --conf-file="$DNSMASQ_CONF" &
     sleep 2
 fi
-pgrep -x dnsmasq &>/dev/null || fatal "dnsmasq won't start. Check: cat /var/log/dnsmasq_err.log"
+pgrep -x dnsmasq &>/dev/null \
+    || fatal "dnsmasq won't start. Check: cat /var/log/dnsmasq_err.log"
 ok "dnsmasq running (PID $(pgrep -x dnsmasq | head -1))"
 
 # =============================================================================
@@ -319,7 +347,7 @@ SKIPPED=0
 
 while IFS= read -r svc; do
     [[ -z "$svc" ]] && continue
-    svc_clean="${svc#\* }"   # strip leading asterisk (disabled services)
+    svc_clean="${svc#\* }"
     CURRENT=$(networksetup -getdnsservers "$svc_clean" 2>/dev/null || true)
     if echo "$CURRENT" | grep -q "^127\.0\.0\.1$"; then
         (( SKIPPED++ )) || true
@@ -382,14 +410,13 @@ else
     ok "Firewall anchor already in $PF_MAIN — refreshing rules"
 fi
 
-# Enable and reload pf
 pfctl -e 2>/dev/null || true
 pfctl -f "$PF_MAIN" 2>/dev/null && ok "Firewall rules loaded" || \
     warn "pf reload returned an error — checking syntax..."
 pfctl -n -f "$PF_MAIN" 2>/dev/null && ok "Firewall syntax verified" || \
     warn "Firewall syntax issue — rules may not be fully active, but DNS encryption is still working"
 
-# Install a LaunchDaemon so pf rules reload automatically after every reboot
+# LaunchDaemon to reload pf rules after every reboot
 cat > "$LAUNCH_DAEMON_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -418,7 +445,7 @@ ok "Firewall rules will reload automatically after every reboot"
 # =============================================================================
 echo ""
 echo -e "${B}  ┌─ Verifying everything is working ${RESET}"
-sleep 2  # give services a moment to fully initialise
+sleep 2
 
 PASS=0; FAIL=0
 
@@ -462,11 +489,11 @@ QUAD9=$(dig +short +time=5 id.server.on.quad9.net txt @127.0.0.1 -p 5300 \
 [[ -n "$QUAD9" ]] && R="pass" || R="fail"
 check "Quad9 confirmed as upstream resolver${QUAD9:+ ($QUAD9)}" "$R"
 
-# 7. Port 853 outbound to Quad9 is open (stubby can reach its upstream)
+# 7. Port 853 outbound to Quad9 is open
 nc -z -w 4 9.9.9.9 853 2>/dev/null && R="pass" || R="fail"
 check "Outbound port 853 (DoT) is open to Quad9" "$R"
 
-# 8. Plaintext DNS leaks — timed capture, no hang
+# 8. Plaintext DNS leak check
 info "Checking for plaintext DNS leaks (5 seconds)..."
 TCPDUMP_TMP=$(mktemp /tmp/dns_leak_check.XXXXXX)
 tcpdump -i any -nn --immediate-mode udp port 53 or tcp port 53 \
@@ -514,7 +541,7 @@ echo ""
 
 if [[ $FAIL -gt 0 ]]; then
     echo -e "  ${Y}Troubleshooting tips:${RESET}"
-    echo "    • Check stubby errors:  sudo stubby -l"
+    echo "    • Check stubby errors:  cat /var/log/stubby_err.log"
     echo "    • Check dnsmasq errors: cat /var/log/dnsmasq_err.log"
     echo "    • Check firewall:       sudo pfctl -sr"
     echo "    • Re-run this script:   sudo bash setup_dns_privacy.sh"
